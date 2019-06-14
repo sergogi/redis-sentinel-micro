@@ -31,6 +31,10 @@ import (
 
 	log "github.com/golang/glog"
 	"github.com/mediocregopher/radix.v2/redis"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	types "k8s.io/apimachinery/pkg/types"
 )
 
 //Constants to be used in the program
@@ -270,6 +274,54 @@ func FindNxtMaster(Servers []*Redis) (*Redis, *Redis) {
 	return nil, Slaves[0]
 }
 
+func initK8Sclient() *kubernetes.Clientset {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error()) 
+	}
+	return clientset
+}
+
+func setK8SRedisPodLabel(clientSet *kubernetes.Clientset, RedisNode *Redis, key string, value string) error {
+	//  k8sPatchStringValue specifies a patch operation for a string
+	type k8sPatchStringValue struct {
+		Op    string `json:"op"`
+		Path  string `json:"path"`
+		Value string `json:"value"`
+	}
+
+	// redis hostname consists k8s object parts: "podName.statfulSetName.namespace:port"
+	hostPort := strings.Split(RedisNode.EndPoint, ":")
+	splitHost := strings.Split(hostPort[0], ".")
+	podName := splitHost[0]
+	podNS := splitHost[2]
+
+	log.Infof("setK8SPodLabel; podName = '%s', podNS = '%s', key = '%s', value = '%s'", podName, podNS, key, value)
+
+	// prepare k8s patch
+	payload := []k8sPatchStringValue{{
+		Op:    "replace",
+		Path:  "/metadata/labels/master",
+		Value: value,
+	}}
+	// apply k8s patch
+	payloadBytes, _ := json.Marshal(payload)
+	_, err := clientSet.
+		CoreV1().
+		Pods(podNS).
+		Patch(podName, types.JSONPatchType, payloadBytes)
+	if err != nil {
+		log.Warningf("PromoteASlave; Error update pod: '%s'", err.Error())
+	} else {
+		log.Infof("PromoteASlave; Pod '%s/%s' sucessfully set as '%s=%s'", podNS, podName, key, value)
+	}
+	return err
+}
+
 //PromoteASlave It will look at all the eligible redis-servers and promote the most eligible one as a new master
 func PromoteASlave(NewMaster *Redis, Servers []*Redis) bool {
 
@@ -281,6 +333,10 @@ func PromoteASlave(NewMaster *Redis, Servers []*Redis) bool {
 		log.Errorf("Unable to make the slave as master response=%v", resp)
 		return false
 	}
+	log.Infof("PromoteASlave; Set NewMaster = %s", NewMaster.EndPoint)
+
+	k8sClient := initK8Sclient()
+	setK8SRedisPodLabel(k8sClient, NewMaster, "master", "true")
 
 	hostPort := strings.Split(NewMaster.EndPoint, ":")
 	NewMaster.MasterHost = hostPort[0]
@@ -308,6 +364,9 @@ func PromoteASlave(NewMaster *Redis, Servers []*Redis) bool {
 			log.Errorf("Unable to make replication timout to 5 seconds = %v", resp)
 			return false
 		}
+		log.Infof("PromoteASlave; Set New Slave = %s", rs.EndPoint)
+
+		setK8SRedisPodLabel(k8sClient, rs, "master", "false")
 	}
 	return result
 
@@ -413,7 +472,7 @@ func main() {
 	//At this point
 
 	//write the master information to /config/master.txt
-	f, err := os.Create("/config/master.txt")
+	f, err := os.OpenFile("/config/master.txt", os.O_CREATE | os.O_RDWR, 0660)
 	if err != nil {
 		log.Errorf("Unable to open the config file err:%v", err)
 		os.Exit(1)
